@@ -11,12 +11,16 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const app = express();
-app.get("/", (_, res) => res.send("PocketFiller Push Server running ✓"));
-app.get("/ping", (_, res) => res.send("pong"));
+app.use(express.json());
+app.get("/",    (_, res) => res.send("PocketFiller Push Server ✓"));
+app.get("/ping",(_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// ── Track processed docs to avoid duplicates ──────────────────────────────
+const processed = new Set();
 
 // ── Send OneSignal push ───────────────────────────────────────────────────
 async function sendPush(playerId, title, body, type) {
-    await axios.post(
+    const res = await axios.post(
         "https://onesignal.com/api/v1/notifications",
         {
             app_id:             ONESIGNAL_APP_ID,
@@ -26,60 +30,76 @@ async function sendPush(playerId, title, body, type) {
             data:               { type: type ?? "notification" },
             priority:           type === "chat" ? 10 : 5,
             android_channel_id: type === "chat" ? "pf_chat" : "pf_notifications",
+            // Make sure notification shows even when app is killed
+            android_background_data: true,
         },
         {
             headers: {
                 "Content-Type":  "application/json",
                 "Authorization": `Basic ${ONESIGNAL_API_KEY}`,
             },
-            timeout: 10000,
+            timeout: 15000,
         }
     );
+    return res.data;
 }
 
-// ── Process a single push_queue doc ──────────────────────────────────────
-async function processDoc(docRef, data) {
+// ── Process a single push_queue document ─────────────────────────────────
+async function processDoc(docRef, data, docId) {
+    if (processed.has(docId)) return; // already handled
+    processed.add(docId);
+
     const { toUid, title, body, type } = data;
 
-    // Delete first to prevent duplicate processing
+    // Delete first to prevent duplicates from parallel runs
     try { await docRef.delete(); } catch (_) {}
 
-    if (!toUid || !title || !body) return;
+    if (!toUid || !title || !body) {
+        console.log(`[SKIP] Missing fields in doc ${docId}`);
+        return;
+    }
 
     try {
-        const userDoc = await db.collection("users").doc(toUid).get();
+        const userDoc  = await db.collection("users").doc(toUid).get();
         const playerId = userDoc.data()?.oneSignalId;
-        if (!playerId) { console.log(`No oneSignalId for ${toUid}`); return; }
 
-        await sendPush(playerId, title, body, type);
-        console.log(`✓ Push sent to ${toUid}: "${title}"`);
+        if (!playerId) {
+            console.log(`[SKIP] No oneSignalId for uid=${toUid}`);
+            return;
+        }
+
+        const result = await sendPush(playerId, title, body, type);
+        console.log(`[OK] Push sent to ${toUid} — recipients: ${result.recipients}`);
     } catch (err) {
-        console.error("Push error:", err?.response?.data ?? err.message);
+        console.error(`[ERR] Push failed for ${docId}:`, err?.response?.data ?? err.message);
     }
 }
 
-// ── Poll push_queue every 3 seconds (more reliable than onSnapshot on free tier) ──
+// ── PRIMARY: Poll every 2 seconds ─────────────────────────────────────────
+// More reliable than onSnapshot on free Render tier
 async function pollQueue() {
     try {
         const snap = await db.collection("push_queue")
             .orderBy("createdAt")
-            .limit(10)
+            .limit(20)
             .get();
 
-        for (const doc of snap.docs) {
-            // Process each doc concurrently
-            processDoc(doc.ref, doc.data()).catch(console.error);
+        if (!snap.empty) {
+            console.log(`[POLL] Found ${snap.size} docs`);
+            await Promise.all(
+                snap.docs.map(doc => processDoc(doc.ref, doc.data(), doc.id))
+            );
         }
     } catch (err) {
-        console.error("Poll error:", err.message);
+        console.error("[POLL ERR]", err.message);
     }
 }
 
-// Start polling immediately and every 3 seconds
+// Start polling immediately
 pollQueue();
-setInterval(pollQueue, 3000);
+const pollInterval = setInterval(pollQueue, 2000);
 
-// ── Also keep onSnapshot as backup ───────────────────────────────────────
+// ── SECONDARY: Firestore realtime listener ────────────────────────────────
 let unsubscribe = null;
 
 function startListener() {
@@ -87,28 +107,44 @@ function startListener() {
 
     unsubscribe = db.collection("push_queue")
         .onSnapshot(
-            async (snapshot) => {
-                for (const change of snapshot.docChanges()) {
+            { includeMetadataChanges: false },
+            async (snap) => {
+                for (const change of snap.docChanges()) {
                     if (change.type === "added") {
-                        processDoc(change.doc.ref, change.doc.data()).catch(console.error);
+                        await processDoc(change.doc.ref, change.doc.data(), change.doc.id);
                     }
                 }
             },
             (err) => {
-                console.error("Snapshot error, restarting listener:", err.message);
-                setTimeout(startListener, 5000); // restart after 5s
+                console.error("[LISTENER ERR] Restarting in 5s:", err.message);
+                setTimeout(startListener, 5000);
             }
         );
-    console.log("Firestore listener active");
+    console.log("[LISTENER] Firestore listener active");
 }
 
 startListener();
 
-// Restart listener every 30 minutes to prevent stale connections
+// Refresh listener every 20 minutes to prevent stale connections
 setInterval(() => {
-    console.log("Refreshing Firestore listener...");
+    console.log("[LISTENER] Refreshing...");
     startListener();
-}, 30 * 60 * 1000);
+    // Also clear processed set to prevent memory leak
+    if (processed.size > 1000) processed.clear();
+}, 20 * 60 * 1000);
+
+// ── Keep-alive: ping self every 4 minutes to prevent Render sleep ─────────
+const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
+if (SERVER_URL) {
+    setInterval(async () => {
+        try {
+            await axios.get(`${SERVER_URL}/ping`, { timeout: 10000 });
+            console.log("[KEEPALIVE] Self-ping ok");
+        } catch (err) {
+            console.error("[KEEPALIVE ERR]", err.message);
+        }
+    }, 4 * 60 * 1000); // every 4 minutes
+}
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`));
