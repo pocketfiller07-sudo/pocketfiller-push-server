@@ -107,7 +107,6 @@ function startListener() {
 
     unsubscribe = db.collection("push_queue")
         .onSnapshot(
-            { includeMetadataChanges: false },
             async (snap) => {
                 for (const change of snap.docChanges()) {
                     if (change.type === "added") {
