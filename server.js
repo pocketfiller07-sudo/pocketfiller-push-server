@@ -10,15 +10,6 @@ app.use(express.json());
 app.get("/",    (_, res) => res.send("PocketFiller Push Server ✓"));
 app.get("/ping",(_, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// ── Start server FIRST so Railway health check passes ─────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`));
-
-// ── Init Firebase Admin AFTER server is listening ─────────────────────────
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-const db = admin.firestore();
-
 // ── Track processed docs to avoid duplicates ──────────────────────────────
 const processed = new Set();
 
@@ -96,16 +87,12 @@ async function pollQueue() {
     }
 }
 
-// Start polling after a short delay to let Firebase init complete
-setTimeout(() => {
-    pollQueue();
-    setInterval(pollQueue, 2000);
-}, 3000);
-
 // ── SECONDARY: Firestore realtime listener ────────────────────────────────
 let unsubscribe = null;
+let db = null;
 
 function startListener() {
+    if (!db) return;
     if (unsubscribe) { try { unsubscribe(); } catch (_) {} }
 
     unsubscribe = db.collection("push_queue")
@@ -125,16 +112,6 @@ function startListener() {
     console.log("[LISTENER] Firestore listener active");
 }
 
-// Start listener after Firebase is ready
-setTimeout(startListener, 3000);
-
-// Refresh listener every 20 minutes
-setInterval(() => {
-    console.log("[LISTENER] Refreshing...");
-    startListener();
-    if (processed.size > 1000) processed.clear();
-}, 20 * 60 * 1000);
-
 // ── Keep-alive: ping self every 4 minutes ────────────────────────────────
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 if (SERVER_URL) {
@@ -147,3 +124,37 @@ if (SERVER_URL) {
         }
     }, 4 * 60 * 1000);
 }
+
+// Refresh listener every 20 minutes
+setInterval(() => {
+    if (!db) return;
+    console.log("[LISTENER] Refreshing...");
+    startListener();
+    if (processed.size > 1000) processed.clear();
+}, 20 * 60 * 1000);
+
+// ── Init Firebase and start polling ──────────────────────────────────────
+function initFirebase() {
+    try {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+        db = admin.firestore();
+        console.log("[FIREBASE] Initialized successfully");
+
+        // Start listener and polling after Firebase is ready
+        startListener();
+        pollQueue();
+        setInterval(pollQueue, 2000);
+
+    } catch (e) {
+        console.error("[FIREBASE] Init failed:", e.message);
+    }
+}
+
+// ── Start server first, then init Firebase ────────────────────────────────
+// Binding to 0.0.0.0 is required for Railway health check to pass
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[SERVER] Running on port ${PORT}`);
+    initFirebase();
+});
