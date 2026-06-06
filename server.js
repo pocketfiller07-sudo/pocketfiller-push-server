@@ -24,7 +24,6 @@ async function sendPush(playerId, title, body, type) {
             contents:           { en: body },
             data:               { type: type ?? "notification" },
             priority:           type === "chat" ? 10 : 5,
-            android_channel_id: type === "chat" ? "pf_chat" : "pf_notifications",
             android_background_data: true,
         },
         {
