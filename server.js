@@ -5,15 +5,19 @@ const express = require("express");
 const ONESIGNAL_APP_ID  = process.env.ONESIGNAL_APP_ID;
 const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY;
 
-// Init Firebase Admin
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-const db = admin.firestore();
-
 const app = express();
 app.use(express.json());
 app.get("/",    (_, res) => res.send("PocketFiller Push Server ✓"));
 app.get("/ping",(_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// ── Start server FIRST so Railway health check passes ─────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`));
+
+// ── Init Firebase Admin AFTER server is listening ─────────────────────────
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+const db = admin.firestore();
 
 // ── Track processed docs to avoid duplicates ──────────────────────────────
 const processed = new Set();
@@ -30,7 +34,6 @@ async function sendPush(playerId, title, body, type) {
             data:               { type: type ?? "notification" },
             priority:           type === "chat" ? 10 : 5,
             android_channel_id: type === "chat" ? "pf_chat" : "pf_notifications",
-            // Make sure notification shows even when app is killed
             android_background_data: true,
         },
         {
@@ -46,12 +49,11 @@ async function sendPush(playerId, title, body, type) {
 
 // ── Process a single push_queue document ─────────────────────────────────
 async function processDoc(docRef, data, docId) {
-    if (processed.has(docId)) return; // already handled
+    if (processed.has(docId)) return;
     processed.add(docId);
 
     const { toUid, title, body, type } = data;
 
-    // Delete first to prevent duplicates from parallel runs
     try { await docRef.delete(); } catch (_) {}
 
     if (!toUid || !title || !body) {
@@ -76,7 +78,6 @@ async function processDoc(docRef, data, docId) {
 }
 
 // ── PRIMARY: Poll every 2 seconds ─────────────────────────────────────────
-// More reliable than onSnapshot on free Render tier
 async function pollQueue() {
     try {
         const snap = await db.collection("push_queue")
@@ -95,9 +96,11 @@ async function pollQueue() {
     }
 }
 
-// Start polling immediately
-pollQueue();
-const pollInterval = setInterval(pollQueue, 2000);
+// Start polling after a short delay to let Firebase init complete
+setTimeout(() => {
+    pollQueue();
+    setInterval(pollQueue, 2000);
+}, 3000);
 
 // ── SECONDARY: Firestore realtime listener ────────────────────────────────
 let unsubscribe = null;
@@ -122,17 +125,17 @@ function startListener() {
     console.log("[LISTENER] Firestore listener active");
 }
 
-startListener();
+// Start listener after Firebase is ready
+setTimeout(startListener, 3000);
 
-// Refresh listener every 20 minutes to prevent stale connections
+// Refresh listener every 20 minutes
 setInterval(() => {
     console.log("[LISTENER] Refreshing...");
     startListener();
-    // Also clear processed set to prevent memory leak
     if (processed.size > 1000) processed.clear();
 }, 20 * 60 * 1000);
 
-// ── Keep-alive: ping self every 4 minutes to prevent Render sleep ─────────
+// ── Keep-alive: ping self every 4 minutes ────────────────────────────────
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL;
 if (SERVER_URL) {
     setInterval(async () => {
@@ -142,8 +145,5 @@ if (SERVER_URL) {
         } catch (err) {
             console.error("[KEEPALIVE ERR]", err.message);
         }
-    }, 4 * 60 * 1000); // every 4 minutes
+    }, 4 * 60 * 1000);
 }
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`));
